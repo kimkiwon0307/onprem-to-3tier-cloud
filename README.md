@@ -22,7 +22,12 @@
 * 기존 단일 서버 구조를 기반으로 Linux 서버 운영 체제 및 네트워크 기본 환경을 이해하고 구축합니다.
 
 ### 🛠️ 사용 기술 및 환경
-* **Hypervisor:** VMware
-* **OS:** Ubuntu Server 24.04 LTS
-* **Web Server:** Apache
-* **Database:** MariaDB
+가상화 툴: VirtualBox 또는 VMware (무료)
+
+OS: Ubuntu Server 또는 Rocky Linux (가상 머신 내에 설치)
+
+Web Server: Apache (80 포트)
+
+WAS: Tomcat (스프링 부트 구동, 8080 포트)
+
+DB: MySQL (3306 포트)
