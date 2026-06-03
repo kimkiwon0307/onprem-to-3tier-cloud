@@ -40,11 +40,11 @@ DB: MySQL (3306 포트)
    2.1 작업 디렉토리 이동 : cd /usr/local/src
    2.2 아파치 및 라이브러리 다운로드
      2.2.1 : sudo wget https://dlcdn.apache.org/httpd/httpd-2.4.67.tar.gz
-     2.2.2 : sudo wget https://dlcdn.apache.org/apr/apr-1.7.5.tar.gz
+     2.2.2 : sudo wget https://dlcdn.apache.org/apr/apr-1.7.6.tar.gz
      2.2.3 : sudo wget https://dlcdn.apache.org/apr/apr-util-1.6.3.tar.gz
    2.3 압축 해제
      2.3.1 : sudo tar -xvf httpd-2.4.67.tar.gz
-     2.3.2 : sudo tar -xvf apr-1.7.5.tar.gz
+     2.3.2 : sudo tar -xvf apr-1.7.6.tar.gz
      2.3.3 : sudo tar -xvf apr-util-1.6.3.tar.gz
    2.4 APR 및 APR-Util을 아파치 내부 srclib 안으로 이동
      2.4.1 sudo mv apr-1.7.5 httpd-2.4.67/srclib/apr
@@ -80,4 +80,6 @@ sudo make && sudo make install
 해결 방법: /usr/local/apache2/conf/httpd.conf 파일을 열어 주석 처리되어 있던 ServerName 부분을 찾아 ServerName localhost:80으로 명시해 준 뒤 서비스를 재시작(graceful)하여 해결했습니다.
 
 
+sudo /usr/local/apache2/bin/apachectl configtest   # Syntax OK 확인
+sudo /usr/local/apache2/bin/apachectl restart
 
