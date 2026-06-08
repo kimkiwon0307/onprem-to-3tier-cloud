@@ -39,27 +39,38 @@ DB: MySQL (3306 포트)
 2. 소스 코드 다운로드 및 압축 해제 : 아파치와 필수 라이브러리들을 /usr/local/src 디렉토리에 다운로드하고 압축을 푼다.
    2.1 작업 디렉토리 이동 : cd /usr/local/src
    2.2 아파치 및 라이브러리 다운로드
-     2.2.1 : sudo wget https://dlcdn.apache.org/httpd/httpd-2.4.67.tar.gz
-     2.2.2 : sudo wget https://dlcdn.apache.org/apr/apr-1.7.6.tar.gz
+      APR : 아파치 웹 서버가 어떤 OS에서든 잘 돌아가도록 돕는 OS 호환성 플랫폼 레이어
+      APR-utill : APR 기반으로 암호화, 데이터베이스 연동, XML 파싱 등 웹 서버가 필요한 부가적인 유틸리티 기능을 모아놓은 라이브러리
+   
+     2.2.1 : sudo wget https://dlcdn.apache.org/httpd/httpd-2.4.68.tar.gz
+     2.2.2 : sudo wget https://dlcdn.apache.org/apr/apr-1.7.6.tar.gz 
      2.2.3 : sudo wget https://dlcdn.apache.org/apr/apr-util-1.6.3.tar.gz
    2.3 압축 해제
      2.3.1 : sudo tar -xvf httpd-2.4.67.tar.gz
      2.3.2 : sudo tar -xvf apr-1.7.6.tar.gz
      2.3.3 : sudo tar -xvf apr-util-1.6.3.tar.gz
-   2.4 APR 및 APR-Util을 아파치 내부 srclib 안으로 이동
+   2.4 APR 및 APR-Util을 아파치 내부 srclib 안으로 이동 : 아파치를 컴파일할때 외부 라이브러리를 내부에 포함시켜서 한 번에 같이 빌드하기 위함
      2.4.1 sudo mv apr-1.7.5 httpd-2.4.67/srclib/apr
      2.4.2 sudo mv apr-util-1.6.3 httpd-2.4.67/srclib/apr-util
    2.5 환경 설정 (Configure) 및 빌드/인스톨 : 아파치 소스 디렉토리로 이동하여 컴파일 옵션을 지정하고 최종 설치를 진행한다.
      2.5.1 : cd /usr/local/src/httpd-2.4.67
      2.5.2 : 꼬임 방지를 위해 이전 빌드 내역 초기화 : sudo make clean
      2.5.3 : 환경 설정 수행 : sudo ./configure --prefix=/usr/local/apache2 --with-included-apr --with-pcre --enable-modules=most --enable-mods-shared=all --enable-ssl
+      sudo ./cofigure : 현재 디렉토리에 있느 ㄴconfigure라는 환경 설정 스크립트를 실행한다.
+      --prefix=/usr/local/apach2 : 아파치가 최종적으로 설치될 기본 디렉토리(경로)를 지정한다.
+      --with-included-apr : 앞서 srclib 폴더 안으로 옮겨두었던 apr과 apr-util 소스 코드를 아파치 빌드 시 내포하여 함께 컴파일하라는 듯 (필수)
+      --with-pcre : 정규 표현식 처리를 위한 라이브러리인 pcre를 사용하겟다고 선언 (필수옵션)
+      --enable-modules=most : 아파치가 제공하는 수많은 기능 모듈 중에서 가장 대중적이고 많이 쓰이는 (Most)핵심 모듈들을 기본적으로 활성화 하라는 의미
+      --enable-mods-shared=all : 모든 모듈을 아파치 덩어리에 통째로 구워버리는게 아니라, 필요할 때마다 뗏다 붙여사다 할수있는 동적 공유 모델 형태로 빌드하라는뜻, 나중에 httpd.conf에서 LoadModule 명령어 한줄로 특정 기능을 켜고 끌수 있다.
+      --enable--sl : 웹 서버 보안의 핵심인 SSL/TLS 암호화 통신 기능을 활성화 하라는 뜻 
+
      2.5.4 : 컴파일 및 설치 진행 : sudo make, sudo make install
    2.6 아파치 설정 수정 및 실행 : 서버 식별 경고를 방지하기 위해 ServerName 설정을 추가한 후 아파치를 구동한다.
      2.6.1 설정 파일 수정 (ServerName 주석 해제 또는 추가) : # sudo nano /usr/local/apache2/conf/httpd.conf 진입 후 ServerName localhost:80 수정
      2.6.2 아파치 서버 시작 : sudo /usr/local/apache2/bin/apachectl start
      2.6.3 구동 확인 : ps -ef | grep httpd
 
-  3. Troubleshooting 정리
+  4. Troubleshooting 정리
      이슈1 : configure: error: Did not find working script at pcre-config
      원인 : 아파치를 컴파일할 때 필요한 정규표현식 라이브러리인 PCRE가 시스템에 없거나, 수동 설치된 경로를 아파치 빌드 스크립트가 인식하지 못함
      해결방법 : 수동 컴파일 대신 우분투 패키지 관리자(APT)를 통해 안정적인 개발용 PCRE 패키지를 설치한 후 설정을 다시 함
