@@ -661,6 +661,388 @@ Spring Boot의 자동 시작, 프로세스 관리, 비정상 종료 시 재시�
 - 서비스 장애 시나리오 및 복구 검증
 - Zabbix 모니터링 및 Jenkins CI/CD 구성
 
+# 08. AWS Multi-AZ 이중화 및 ALB 구축
+
+## 1. 프로젝트 개요
+
+### 목표
+
+기존 AWS 단일 가용 영역(AZ-A)의 WEB/WAS 서버를 AMI로 복제하여 AZ-C에도 배치하고, Application Load Balancer(ALB)를 사용해 외부 요청을 분산한다.
+
+또한 로드밸런싱 이후 발생한 회원가입 403 오류를 분석하고, WEB 서버 장애 발생 시 서비스 유지 여부를 검증한다.
+
+### 주요 학습 내용
+
+- Amazon Machine Image(AMI)를 이용한 EC2 복제
+- 서로 다른 가용 영역에 WEB/WAS 서버 배치
+- 동일 VPC 내부의 AZ 간 통신
+- ALB 및 Target Group 구성
+- Health Check를 통한 대상 서버 상태 확인
+- Sticky Session을 이용한 세션 불일치 완화
+- WEB 서버 장애 발생 및 복구 테스트
+
+---
+
+## 2. 시스템 아키텍처
+
+```text
+                 Internet
+                    |
+                    v
+             Application LB
+               marble-alb
+                    |
+              marble-tg-web
+                    |
+          +---------+---------+
+          |                   |
+        AZ-A                AZ-C
+          |                   |
+        WEB01               WEB02
+        Apache              Apache
+          |                   |
+        WAS01               WAS02
+      Spring Boot         Spring Boot
+          |                   |
+          +---------+---------+
+                    |
+                  DB01
+                  MySQL
+                  AZ-A
+```
+
+### 네트워크 구성
+
+| 구분 | AZ-A | AZ-C |
+|---|---|---|
+| Availability Zone | ap-northeast-2a | ap-northeast-2c |
+| Public Subnet | marble-public-a | marble-public-c |
+| WEB Subnet | marble-web-a | marble-web-c |
+| WAS Subnet | marble-was-a | marble-was-c |
+| WEB EC2 | marble-web01 | marble-web02 |
+| WAS EC2 | marble-was01 | marble-was02 |
+
+- VPC: `marble-vpc`
+- VPC CIDR: `10.0.0.0/16`
+- ALB: 인터넷 연결형, Public Subnet A/C 사용
+- WEB/WAS/DB: Private Subnet 배치
+- DB01: AZ-A의 단일 MySQL 서버
+
+ALB는 Public Subnet에 배치하지만 WEB 서버는 Private Subnet에 유지하여 외부에서 WEB EC2로 직접 접근하지 않도록 구성했다.
+
+---
+
+## 3. AMI 기반 EC2 복제
+
+### WEB 서버 복제
+
+기존 `marble-web01`에서 다음 AMI를 생성했다.
+
+- AMI 이름: `marble-web-ami-v1`
+- 포함 환경: Ubuntu 24.04, Apache, Reverse Proxy 설정
+- 새 인스턴스: `marble-web02`
+- 배치 위치: `marble-web-c` (AZ-C)
+- 보안 그룹: `marble-sg-web`
+
+### WAS 서버 복제
+
+기존 `marble-was01`에서 다음 AMI를 생성했다.
+
+- AMI 이름: `marble-was-ami-v1`
+- 포함 환경: Java 21, Spring Boot JAR, systemd 서비스
+- 새 인스턴스: `marble-was02`
+- 배치 위치: `marble-was-c` (AZ-C)
+- 보안 그룹: `marble-sg-was`
+
+AMI는 운영체제와 디스크에 저장된 애플리케이션 및 설정을 복제하지만, 새 EC2의 서브넷, 사설 IP, 보안 그룹 등은 인스턴스 생성 시 별도로 지정해야 한다.
+
+**보안 주의사항:** 이번 실습에서 생성한 WAS AMI에는 기존 DB 접속 인증 정보가 포함됐을 가능성이 있다. AMI를 비공개로 유지하고, 인증 정보 교체 및 불필요한 AMI/스냅샷 삭제가 필요하다.
+
+---
+
+## 4. WEB02와 WAS02 연결
+
+AMI로 복제한 WEB02는 처음에 WEB01의 설정을 그대로 사용하여 WAS01로 요청을 전달했다.
+
+WEB02의 Apache 설정을 변경하여 WAS02로 요청을 전달하도록 구성했다.
+
+설정 파일:
+
+`/etc/apache2/sites-available/marble.conf`
+
+핵심 설정:
+
+```apache
+ProxyRequests Off
+ProxyPreserveHost On
+
+ProxyPass / http://<WAS02_PRIVATE_IP>:8080/
+ProxyPassReverse / http://<WAS02_PRIVATE_IP>:8080/
+```
+
+설정 검사 및 적용:
+
+```bash
+sudo apache2ctl configtest
+sudo systemctl reload apache2
+```
+
+통신 확인:
+
+```bash
+curl -i -H 'Host: marble.test' \
+  http://127.0.0.1/health/db
+```
+
+검증 결과:
+
+- Apache 설정 문법 정상
+- WEB02 → WAS02 연결 정상
+- WAS02 → DB01 연결 정상
+- `/health/db` HTTP 200
+- 응답: `{"status":"UP","db":"UP"}`
+
+---
+
+## 5. ALB 및 Target Group 구성
+
+### ALB
+
+| 설정 | 값 |
+|---|---|
+| Name | marble-alb |
+| Type | Application Load Balancer |
+| Scheme | Internet-facing |
+| IP address type | IPv4 |
+| Availability Zones | ap-northeast-2a, ap-northeast-2c |
+| Subnets | marble-public-a, marble-public-c |
+| Security Group | marble-sg-alb |
+| Listener | HTTP:80 |
+| Target Group | marble-tg-web |
+
+### Target Group
+
+| 설정 | 값 |
+|---|---|
+| Name | marble-tg-web |
+| Target type | Instances |
+| Protocol | HTTP |
+| Port | 80 |
+| Targets | marble-web01, marble-web02 |
+| Health Check | /health/db |
+| Success code | 200 |
+
+### 보안 그룹 통신
+
+| 출발지 | 목적지 | 포트 |
+|---|---|---|
+| Internet | ALB | TCP 80 |
+| ALB SG | WEB SG | TCP 80 |
+| WEB SG | WAS SG | TCP 8080 |
+| WAS SG | DB SG | TCP 3306 |
+
+### 정상 동작 확인
+
+- ALB 상태: Active
+- WEB01 Target 상태: Healthy
+- WEB02 Target 상태: Healthy
+- ALB DNS `/health/db`: HTTP 200, DB UP
+
+**설계 한계:** `/health/db`는 DB까지 확인하는 종단 간 헬스체크이므로 DB 장애 시 두 WEB 대상이 동시에 비정상으로 판단될 수 있다. 운영 환경에서는 WEB 자체의 상태 확인과 DB 연결 확인을 목적에 따라 분리할 필요가 있다.
+
+---
+
+## 6. 장애 사례 — 회원가입 403 Forbidden
+
+### 장애 현상
+
+ALB를 통해 회원가입을 시도하는 과정에서 간헐적으로 다음 오류가 발생했다.
+
+```text
+Whitelabel Error Page
+
+There was an unexpected error
+(type=Forbidden, status=403).
+```
+
+한 번 실패한 뒤 다시 성공하거나, 새로운 시크릿 브라우저 창에서 재시도 시 다시 실패하는 등 간헐적인 양상이 나타났다.
+
+### 장애 범위 축소
+
+| 테스트 환경 | 결과 |
+|---|---|
+| WEB01 → WAS01 단독 | 회원가입 정상 |
+| WEB02 → WAS02 단독 | 회원가입 정상 |
+| WEB01/02 동시 운영 | 간헐적 HTTP 403 |
+| Sticky Session 활성화 | 회원가입 정상 |
+
+### 원인 가설
+
+Spring Security에서 세션 기반 CSRF 보호를 사용하는 경우, 회원가입 화면을 처리한 WAS와 회원가입 POST를 처리한 WAS가 다르면 세션에 저장된 CSRF 토큰이 일치하지 않을 수 있다.
+
+현재 두 WAS가 독립적인 세션을 유지하는 구조이므로, 서버 간 세션 불일치가 가장 유력한 원인으로 판단했다.
+
+단, Spring Security 로그에서 CSRF 예외를 직접 확인한 것은 아니므로 확정 원인이 아닌 **검증 결과에 근거한 가설**로 기록한다.
+
+### 적용한 완화 조치
+
+AWS Target Group의 Sticky Session 기능을 활성화했다.
+
+| 설정 | 값 |
+|---|---|
+| Target Group | marble-tg-web |
+| Stickiness | Enabled |
+| Type | Load balancer generated cookie |
+| Duration | 1 hour |
+
+Sticky Session은 브라우저별 요청을 같은 WEB 대상에 유지하도록 한다.
+
+현재 WEB01 → WAS01, WEB02 → WAS02로 연결되어 있으므로 사용자 요청이 동일 WAS로 전달되는 효과가 있다.
+
+### 결과 및 한계
+
+- Sticky Session 활성화 후 회원가입 정상 확인
+- 서버 간 요청 이동에 따른 세션 불일치 가능성 완화
+- Sticky Session만으로 세션 자체가 공유되는 것은 아님
+- 장애 전환 시 기존 세션이 유지된다고 보장할 수 없음
+
+향후 개선안으로 Spring Session과 Redis/JDBC 기반의 공용 세션 저장소 구성을 검토할 수 있다.
+
+---
+
+## 7. WEB 서버 장애 전환 테스트
+
+### 테스트 목적
+
+WEB01 장애 발생 시 ALB가 정상인 WEB02를 통해 서비스를 유지할 수 있는지 확인한다.
+
+### 장애 발생
+
+WEB01에서 Apache 중지:
+
+```bash
+sudo systemctl stop apache2
+sudo systemctl is-active apache2
+```
+
+기대 결과:
+
+```text
+inactive
+```
+
+### 장애 상태 확인
+
+Target Group에서 다음 상태를 확인하는 방식으로 테스트한다.
+
+| 대상 | 예상 상태 |
+|---|---|
+| WEB01 | Unhealthy |
+| WEB02 | Healthy |
+
+### 외부 접속 검증
+
+ALB DNS 주소에서 다음 경로 호출:
+
+```text
+http://<ALB_DNS_NAME>/health/db
+```
+
+**실제 테스트 결과: 정상 응답**
+
+WEB01의 Apache를 중지한 상태에서도 ALB를 통한 `/health/db` 요청에 정상 응답했다.
+
+이는 정상인 WEB02 → WAS02 → DB01 경로를 통해 서비스가 유지될 수 있음을 보여준다.
+
+### WEB01 복구
+
+```bash
+sudo systemctl start apache2
+sudo systemctl is-active apache2
+sudo apache2ctl configtest
+```
+
+최종 확인:
+
+- WEB01: Healthy
+- WEB02: Healthy
+- ALB 경유 서비스 정상
+
+---
+
+## 8. 검증 결과 요약
+
+| 검증 항목 | 결과 |
+|---|---|
+| WEB01 AMI 생성 | 성공 |
+| WAS01 AMI 생성 | 성공 |
+| AZ-C에 WEB02 배치 | 성공 |
+| AZ-C에 WAS02 배치 | 성공 |
+| WEB02 → WAS02 → DB01 | 성공 |
+| ALB 외부 HTTP 접속 | 성공 |
+| WEB01/WEB02 Health Check | 성공 |
+| 회원가입 403 장애 재현 | 성공 |
+| Sticky Session 적용 후 회원가입 | 정상 |
+| WEB01 장애 시 서비스 유지 | 성공 |
+| WEB01 재시작 및 Target 복구 | 성공 |
+
+---
+
+## 9. 현재 구성의 한계 및 개선 계획
+
+### 1. DB 단일 장애 지점
+
+WEB과 WAS는 두 가용 영역에 배치했지만 DB01은 AZ-A에 단독으로 존재한다.
+
+따라서 DB01 장애 발생 시 전체 애플리케이션이 영향을 받을 수 있다.
+
+향후 MySQL Primary/Replica 복제를 구성하고 수동 장애 전환을 검증할 예정이다.
+
+### 2. WAS 세션 공유 미구현
+
+현재 Sticky Session으로 회원가입 문제를 완화했지만, WAS 장애 후 세션 유지까지 보장하지는 못한다.
+
+세션 공유 또는 애플리케이션의 무상태화가 개선 과제다.
+
+### 3. Apache WAS 로드밸런싱 미구현
+
+현재는 WEB01 → WAS01, WEB02 → WAS02가 각각 고정되어 있다.
+
+향후 Apache `mod_proxy_balancer`를 이용하여 두 WAS에 요청을 분산하도록 개선할 예정이다.
+
+### 4. 인증 정보 관리
+
+WAS AMI에 DB 접속 정보가 포함됐을 가능성이 있으므로 DB 비밀번호 변경, 환경 설정 갱신, 불필요한 AMI 및 관련 EBS 스냅샷 정리가 필요하다.
+
+### 5. HTTPS 미구현
+
+현재 ALB는 HTTP 80을 사용한다.
+
+실제 서비스에서는 TLS 인증서와 HTTPS 리스너를 이용한 암호화 통신이 필요하다.
+
+---
+
+## 10. 배운 점
+
+1. AMI로 서버 운영체제와 설치 환경을 재사용할 수 있지만, 새 EC2의 네트워크 배치는 별도로 결정한다.
+2. 같은 VPC에 있다면 가용 영역이 달라도 사설 IP 통신이 가능하다.
+3. ALB를 사용하면 다수 WEB 서버의 상태를 확인하고 정상 대상으로 요청을 전달할 수 있다.
+4. 다중 서버 전환 후에는 단일 서버에서 나타나지 않던 세션 및 인증 문제가 발생할 수 있다.
+5. 장애 분석은 서버별 단독 테스트처럼 범위를 단계적으로 좁히는 것이 효과적이다.
+6. Sticky Session은 세션 불일치 문제를 완화하지만 세션 공유의 완전한 대체재는 아니다.
+7. 고가용성은 단순히 서버 수를 늘리는 것으로 완성되지 않으며, DB·세션·보안·장애 복구까지 함께 검토해야 한다.
+
+---
+
+## 11. 다음 단계
+
+**9교시 — AWS 이전 및 네트워크·보안 검증**
+
+- 기존 VMware와 AWS 데이터 이전 결과 확인
+- 전체 3-Tier 통신 경로 재검증
+- Security Group 및 라우팅 점검
+- 인증 정보 및 AMI 보안 정리
+- 장애 시나리오와 운영 검증 기록
 
 
 
