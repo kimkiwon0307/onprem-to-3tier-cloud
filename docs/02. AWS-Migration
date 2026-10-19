@@ -1045,4 +1045,525 @@ WAS AMI에 DB 접속 정보가 포함됐을 가능성이 있으므로 DB 비밀�
 - 장애 시나리오와 운영 검증 기록
 
 
+# 09. AWS 마이그레이션 최종 검증 및 보안 점검
+
+## 1. 프로젝트 개요
+
+### 목표
+
+기존 VMware On-Premises 환경에서 AWS로 이전한 Marble 3-Tier 인프라의 데이터 정합성, 네트워크 접근 제어, 인증 정보 관리 및 서비스 복구 가능성을 검증한다.
+
+단순히 서비스가 정상 실행되는 것에서 나아가, 실제 운영 환경을 고려하여 **허용된 통신은 정상적으로 이루어지고, 불필요한 접근은 차단되는지** 확인한다.
+
+### 주요 학습 내용
+
+- VMware와 AWS MySQL 데이터 비교
+- 3-Tier 네트워크 통신 및 접근 제어 검증
+- AWS Security Group의 최소 권한 원칙
+- Public/Private Subnet 라우팅 점검
+- Spring Boot 환경변수 파일 권한 관리
+- MySQL 계정 비밀번호 교체 및 AMI 보안
+- systemd 기반 애플리케이션 운영 및 복구 검증
+
+---
+
+## 2. AWS 시스템 아키텍처
+
+```text
+                         Internet
+                            |
+                            v
+                    marble-alb
+                Public Subnet A/C
+                            |
+                    marble-tg-web
+                            |
+              +-------------+-------------+
+              |                           |
+            AZ-A                        AZ-C
+              |                           |
+            WEB01                       WEB02
+            Apache                      Apache
+              |                           |
+            WAS01                       WAS02
+          Spring Boot                 Spring Boot
+              |                           |
+              +-------------+-------------+
+                            |
+                          DB01
+                          MySQL
+                          AZ-A
+```
+
+### 인프라 구성
+
+| 구분 | 설정 |
+|---|---|
+| Region | ap-northeast-2 (Seoul) |
+| VPC | marble-vpc |
+| VPC CIDR | 10.0.0.0/16 |
+| Availability Zones | ap-northeast-2a, ap-northeast-2c |
+| ALB | marble-alb |
+| Target Group | marble-tg-web |
+| WEB | Apache 2.4 |
+| WAS | Java 21, Spring Boot |
+| DB | MySQL |
+| 관리 서버 | Bastion Host |
+
+WEB/WAS/DB 인스턴스는 Private Subnet에 배치하고, 외부 요청은 Public Subnet의 ALB를 통해 전달하도록 구성했다.
+
+---
+
+## 3. VMware ↔ AWS 데이터 정합성 검증
+
+### 검증 목적
+
+AWS로 데이터베이스를 이전한 이후 애플리케이션에서 DB 연결이 성공하더라도 실제 데이터가 누락되었을 가능성은 남아 있다.
+
+따라서 기존 VMware DB와 AWS DB의 데이터를 비교하여 마이그레이션 결과를 점검했다.
+
+### 비교 대상
+
+| 구분 | 기존 환경 | 이전 환경 |
+|---|---|---|
+| 플랫폼 | VMware | AWS EC2 |
+| 서버 | DB01 | marble-db01 |
+| DBMS | MySQL | MySQL |
+| Database | marble | marble |
+
+### 검증 명령어
+
+각 DB 서버에서 다음 명령어를 사용하여 데이터베이스와 테이블을 확인했다.
+
+```bash
+sudo mysql
+```
+
+```sql
+SHOW DATABASES;
+
+USE marble;
+
+SHOW TABLES;
+```
+
+필요한 경우 테이블별 행 개수를 비교할 수 있다.
+
+```sql
+SELECT COUNT(*) FROM 테이블명;
+```
+
+### 검증 결과
+
+**사용자 확인 결과: VMware와 AWS의 데이터 일치**
+
+기존 데이터가 AWS 환경에 존재하는 것을 확인했다.
+
+다만 정확한 테이블별 건수, 체크섬, 비교 시점의 스냅샷 결과는 별도로 기록되지 않았다. 따라서 데이터 정합성에 대한 엄밀한 증빙을 남기려면 테이블별 행 개수와 주요 데이터의 해시 비교 등을 추가로 수행할 필요가 있다.
+
+또한 AWS에서 회원가입 테스트를 진행하면서 생성된 신규 데이터는 VMware의 이전 시점 데이터와 구분해야 한다.
+
+---
+
+## 4. 네트워크 접근 제어 검증
+
+### 4.1 검증 목적
+
+3-Tier 환경에서는 각 계층이 필요한 서비스에만 접근하도록 제한해야 한다.
+
+현재 Marble 프로젝트의 통신 정책은 다음과 같다.
+
+| Source | Destination | Port | 정책 |
+|---|---|---|---|
+| Internet | ALB | TCP 80 | 허용 |
+| ALB SG | WEB SG | TCP 80 | 허용 |
+| WEB SG | WAS SG | TCP 8080 | 허용 |
+| WAS SG | DB SG | TCP 3306 | 허용 |
+| Bastion SG | EC2 서버 SG | TCP 22 | 허용 |
+| WEB SG | DB SG | TCP 3306 | 차단 |
+
+### 4.2 WEB02 → DB01 직접 접근 테스트
+
+WEB02에서 다음 명령어를 실행했다.
+
+```bash
+nc -vz -w 3 <DB01_PRIVATE_IP> 3306
+```
+
+테스트 결과:
+
+```text
+Connection timed out
+```
+
+**검증 결과: WEB02에서 DB01의 TCP 3306 포트로 직접 연결할 수 없음을 확인했다.**
+
+이는 WEB 계층의 불필요한 DB 접근이 차단된다는 의도와 일치한다.
+
+단, `Connection timed out`만으로 특정 보안 그룹 규칙이 유일한 차단 원인이라고 단정할 수는 없다. 따라서 AWS 보안 그룹 설정도 함께 확인했다.
+
+### 4.3 WAS02 → DB01 정상 접근 검증
+
+WAS02에서 Spring Boot의 DB 헬스체크를 실행했다.
+
+```bash
+curl -i http://127.0.0.1:8080/health/db
+```
+
+검증 결과:
+
+```text
+HTTP/1.1 200
+
+{"status":"UP","db":"UP"}
+```
+
+**검증 결과: WAS02의 애플리케이션에서 DB01 연결 성공**
+
+WEB의 DB 직접 접근은 차단하면서, WAS의 DB 접근은 허용하는 계층별 접근 정책을 확인했다.
+
+---
+
+## 5. Security Group 검증
+
+### 5.1 DB 보안 그룹
+
+보안 그룹 이름:
+
+`marble-sg-db`
+
+확인된 인바운드 규칙:
+
+| Type | Protocol | Port | Source |
+|---|---|---|---|
+| SSH | TCP | 22 | marble-sg-bastion |
+| MySQL/Aurora | TCP | 3306 | marble-sg-was |
+
+검증 결과:
+
+- DB 관리용 SSH는 Bastion 보안 그룹에만 허용
+- MySQL 연결은 WAS 보안 그룹에만 허용
+- WEB 보안 그룹의 직접 DB 접근은 허용하지 않음
+- 전체 인터넷 또는 VPC 대역에 대한 광범위한 DB 접근 규칙 없음
+
+### 5.2 Security Group 참조 방식
+
+AWS Security Group은 특정 IP뿐 아니라 다른 Security Group을 통신 허용 대상으로 지정할 수 있다.
+
+예를 들어 DB의 3306 포트에서 `marble-sg-was`를 허용하면 해당 보안 그룹을 사용하는 WAS01과 WAS02에 공통으로 정책을 적용할 수 있다.
+
+이를 통해 인스턴스의 사설 IP가 변경되어도 보안 정책을 일관되게 관리할 수 있다.
+
+### 5.3 보안 설계 원칙
+
+**최소 권한 원칙(Least Privilege)**
+
+서비스 운영에 필요한 접근만 허용하고 불필요한 네트워크 경로는 제한한다.
+
+계층별 네트워크 분리를 적용하면 한 서버가 침해되었을 때 다른 계층으로의 직접적인 접근 가능성을 줄일 수 있다.
+
+---
+
+## 6. VPC 라우팅 테이블 검증
+
+### 6.1 Public Subnet
+
+Public 라우팅 테이블에서 다음 경로를 확인했다.
+
+| Destination | Target |
+|---|---|
+| 10.0.0.0/16 | local |
+| 0.0.0.0/0 | Internet Gateway |
+
+Public Subnet:
+
+- marble-public-a
+- marble-public-c
+
+Internet-facing ALB와 Bastion은 Public Subnet을 사용한다.
+
+### 6.2 Private Subnet
+
+Private 라우팅 테이블에서는 VPC 내부 통신을 위한 Local 경로를 확인했다.
+
+| Destination | Target |
+|---|---|
+| 10.0.0.0/16 | local |
+
+Private Subnet에 배치된 WEB/WAS/DB 인스턴스는 공인 IP 없이 운영한다.
+
+기존 임시 NAT Gateway는 패키지 설치 이후 삭제했다.
+
+### 6.3 서로 다른 AZ 간 통신
+
+AWS VPC의 Local 라우팅을 통해 AZ-A와 AZ-C의 서버 간 사설 IP 통신이 가능하다.
+
+```text
+WEB02 (AZ-C)
+      |
+      v
+WAS02 (AZ-C)
+      |
+      v
+DB01 (AZ-A)
+```
+
+검증 결과:
+
+- WEB02 → WAS02 정상
+- WAS02 → DB01 정상
+- NAT Gateway 없이 VPC 내부 통신 가능
+
+---
+
+## 7. WAS 환경변수 파일 보안 점검
+
+### 7.1 환경변수 파일
+
+현재 Spring Boot는 DB 접속 정보를 다음 파일에서 읽는다.
+
+```text
+/etc/marble/marble.env
+```
+
+해당 파일에는 DB 서버 주소와 계정 및 비밀번호가 포함되어 있다.
+
+파일 내용을 GitHub에 업로드하거나 터미널 출력으로 공개하지 않도록 주의한다.
+
+### 7.2 접근 권한 확인
+
+WAS01과 WAS02에서 다음 명령어를 실행했다.
+
+```bash
+sudo stat -c '%a %U:%G %n' /etc/marble
+
+sudo stat -c '%a %U:%G %n' /etc/marble/marble.env
+```
+
+확인된 결과:
+
+```text
+700 root:root /etc/marble
+
+600 root:root /etc/marble/marble.env
+```
+
+권한 의미:
+
+| 권한 | 의미 |
+|---|---|
+| 700 | 디렉터리 소유자만 접근 |
+| 600 | 파일 소유자만 읽기·쓰기 |
+
+이를 통해 일반 사용자가 DB 접속 정보에 직접 접근하는 것을 제한한다.
+
+단, 파일 권한이 제한되어 있어도 해당 파일이 저장된 EBS 스냅샷을 복원할 권한이 있다면 내용에 접근할 수 있으므로 이미지 보안은 별도로 관리해야 한다.
+
+---
+
+## 8. DB 인증 정보 교체 및 AMI 보안
+
+### 8.1 보안 위험
+
+8교시에서는 WAS01을 AMI로 복제하여 WAS02를 생성했다.
+
+사용한 AMI:
+
+`marble-was-ami-v1`
+
+기존 WAS01의 디스크에 DB 접속 비밀번호가 저장되어 있었으므로 AMI와 관련 EBS 스냅샷에 기존 인증 정보가 포함될 수 있었다.
+
+### 8.2 비밀번호 교체 절차
+
+다음 절차로 인증 정보를 교체하도록 구성했다.
+
+1. 새 DB 비밀번호 준비
+2. WAS01/WAS02의 `marble.env` 수정
+3. WAS01/WAS02 Spring Boot 서비스 중지
+4. DB01 MySQL 계정 비밀번호 변경
+5. 두 WAS 서비스 재시작
+6. `/health/db` 및 ALB Target 상태 검증
+
+MySQL 계정 확인:
+
+```sql
+SELECT user, host
+FROM mysql.user
+WHERE user = 'marble';
+```
+
+실제 비밀번호 변경 시에는 조회된 정확한 `user`와 `host` 조합을 사용해야 한다.
+
+DB 계정 비밀번호를 교체한 뒤 WAS01/WAS02 모두 새 비밀번호로 연결되는지 검증해야 한다.
+
+**주의:** 비밀번호 변경 결과와 변경 전후의 인증 성공 증빙은 별도로 보관하지 않았으므로 최종 점검 시 두 WAS의 DB 연결 상태를 재확인한다.
+
+### 8.3 기존 WAS AMI 정리
+
+보안상 필요하지 않은 기존 이미지와 스냅샷은 다음과 같이 정리하도록 계획했다.
+
+| 리소스 | 처리 |
+|---|---|
+| marble-was-ami-v1 | 등록 해제 |
+| 관련 EBS 스냅샷 | 삭제 |
+| marble-web-ami-v1 | 유지 |
+| WAS01/WAS02 EC2 | 유지 |
+
+AMI 등록 해제와 EBS 스냅샷 삭제는 별개 작업이며, 관련 스냅샷이 남아 있다면 디스크 데이터와 저장 비용이 계속 유지될 수 있다.
+
+정리 작업 진행 후에는 AWS 콘솔에서 대상 AMI와 연결 스냅샷이 실제로 없어졌는지 최종 확인해야 한다.
+
+### 8.4 향후 개선 방안
+
+운영 환경에서는 DB 인증 정보를 서버 이미지에 포함하지 않는 것이 바람직하다.
+
+향후 적용 가능한 방법:
+
+- AWS Systems Manager Parameter Store
+- AWS Secrets Manager
+- IAM 역할을 이용한 인증 정보 접근 제어
+- 애플리케이션 실행 시 인증 정보 주입
+
+이러한 방식은 비밀번호를 AMI에서 분리하고 인증 정보 교체를 용이하게 하는 데 도움이 된다.
+
+---
+
+## 9. Spring Boot 서비스 운영 검증
+
+### 9.1 systemd 자동 시작 설정
+
+WAS 인스턴스에서 다음 명령어를 통해 서비스 자동 시작 여부를 확인할 수 있다.
+
+```bash
+sudo systemctl is-enabled marble
+```
+
+정상 결과:
+
+```text
+enabled
+```
+
+### 9.2 서비스 재시작 테스트
+
+```bash
+sudo systemctl restart marble
+
+sudo systemctl is-active marble
+```
+
+정상 결과:
+
+```text
+active
+```
+
+### 9.3 DB 연결 검증
+
+```bash
+curl -i http://127.0.0.1:8080/health/db
+```
+
+기대 결과:
+
+```text
+HTTP/1.1 200
+
+{"status":"UP","db":"UP"}
+```
+
+### 9.4 서비스 로그 확인
+
+```bash
+sudo journalctl -u marble -n 30 --no-pager
+```
+
+로그에서 다음 사항을 점검한다.
+
+- Spring Boot 시작 실패 여부
+- DB 인증 오류 여부
+- JDBC 연결 오류 여부
+- 애플리케이션 예외 발생 여부
+
+**추가 확인 사항:** 이번 9교시의 최종 WAS02 재시작 테스트 결과는 별도로 전달되지 않았으므로, 재시작 후 HTTP 200 확인 결과를 남기면 검증 기록을 완성할 수 있다.
+
+---
+
+## 10. 9교시 검증 결과
+
+| 검증 항목 | 결과 |
+|---|---|
+| VMware ↔ AWS 데이터 비교 | 일치 확인 |
+| WEB02 → DB01 직접 접근 | Timeout 확인 |
+| WAS02 → DB01 연결 | 정상 |
+| DB Security Group | 22/3306 허용 출처 확인 |
+| Public Route Table | Local + IGW 확인 |
+| Private Route Table | Local 확인 |
+| WAS01 환경 파일 권한 | 700/600 확인 |
+| WAS02 환경 파일 권한 | 700/600 확인 |
+| DB 비밀번호 변경 후 연결 | 최종 재확인 필요 |
+| WAS AMI 및 스냅샷 삭제 | 콘솔에서 최종 재확인 필요 |
+| WAS02 재시작 후 정상 응답 | 최종 결과 기록 필요 |
+
+---
+
+## 11. 이번 교시에서 배운 점
+
+### 1. DB 연결 성공과 데이터 정합성은 다르다
+
+Spring Boot가 MySQL에 연결됐다는 사실만으로 모든 데이터가 정상 이전됐다고 판단할 수 없다. 테이블과 실제 데이터의 비교가 필요하다.
+
+### 2. 허용 테스트만큼 차단 테스트도 중요하다
+
+WEB에서 DB에 직접 접근할 수 없어야 한다는 요구사항을 실제 포트 연결 테스트와 Security Group 설정 확인으로 검증했다.
+
+### 3. Security Group과 Route Table은 역할이 다르다
+
+- Security Group: 어떤 네트워크 통신을 허용할지 결정
+- Route Table: 목적지 네트워크로 패킷을 전달할 경로 결정
+
+두 설정이 모두 정상이어야 의도한 통신이 이루어진다.
+
+### 4. AMI는 보안 정보도 함께 복제할 수 있다
+
+AMI에 환경변수 파일이나 인증 정보가 포함되어 있으면 이미지 복제 과정에서 민감 정보도 함께 확산될 수 있다.
+
+따라서 이미지 생성 전 민감 정보 분리, 인증 정보 교체 및 불필요한 스냅샷 정리가 필요하다.
+
+### 5. 서비스 재시작 이후의 검증이 중요하다
+
+systemd에서 프로세스가 실행 중인 것과 실제 애플리케이션이 정상 동작하는 것은 다르다.
+
+서비스 상태, HTTP 응답, DB 연결, 로그를 함께 확인해야 한다.
+
+---
+
+## 12. 다음 단계
+
+**10교시 — Apache WAS 로드밸런싱**
+
+현재는 다음과 같이 WEB 서버가 각각 특정 WAS로 고정되어 있다.
+
+```text
+WEB01 → WAS01
+WEB02 → WAS02
+```
+
+10교시에서는 Apache `mod_proxy_balancer`를 이용해 다음 구조로 개선할 예정이다.
+
+```text
+              WEB01 ──┬── WAS01
+                      └── WAS02
+
+              WEB02 ──┬── WAS01
+                      └── WAS02
+```
+
+주요 실습:
+
+- Apache WAS 로드밸런싱 구성
+- WAS01/WAS02 대상 등록
+- WAS 장애 시 요청 처리 검증
+- Sticky Session과 WAS 세션 공유 문제 검토
+- 설정 변경 후 서비스 정상 동작 검증
 
