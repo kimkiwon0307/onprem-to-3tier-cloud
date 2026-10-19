@@ -131,3 +131,191 @@ EC2 간 통신, 인터넷 접근, Security Group 및 애플리케이션 연결�
 - AMI 기반 WEB/WAS 이중화
 - ALB 및 MySQL 복제 구성
 
+# 06. AWS Security Group 및 Bastion Host 구축
+
+## 1. 구축 목적
+
+Marble 애플리케이션의 AWS 3-Tier 인프라에 서버 역할별 접근 제어 정책을 적용하고, Private Subnet에 배치할 WEB/WAS/DB 서버를 안전하게 관리하기 위한 Bastion Host를 구성한다.
+
+### 설계 목표
+
+- ALB만 외부 HTTP 요청을 수신하도록 구성
+- WEB, WAS, DB 간 필요한 서비스 포트만 허용
+- Private EC2에 퍼블릭 IP를 할당하지 않는 구조 준비
+- SSH 관리자 접근을 Bastion Host로 제한
+- IP 주소보다 Security Group 참조를 활용하여 접근 정책 관리
+
+## 2. Security Group 설계
+
+### 2.1 애플리케이션 통신 구조
+
+```text
+Internet User
+    |
+    | TCP 80
+    v
+ALB (marble-sg-alb)
+    |
+    | TCP 80
+    v
+WEB01 / WEB02 (marble-sg-web)
+    |
+    | TCP 8080
+    v
+WAS01 / WAS02 (marble-sg-was)
+    |
+    | TCP 3306
+    v
+MySQL DB (marble-sg-db)
+```
+
+### 2.2 Security Group 정책
+
+| Security Group | Protocol / Port | Source |
+|---|---|---|
+| marble-sg-alb | TCP 80 | 0.0.0.0/0 |
+| marble-sg-web | TCP 80 | marble-sg-alb |
+| marble-sg-web | TCP 22 | marble-sg-bastion |
+| marble-sg-was | TCP 8080 | marble-sg-web |
+| marble-sg-was | TCP 22 | marble-sg-bastion |
+| marble-sg-db | TCP 3306 | marble-sg-was |
+| marble-sg-db | TCP 22 | marble-sg-bastion |
+| marble-sg-bastion | TCP 22 | 관리자 공인 IP /32 |
+
+Security Group의 아웃바운드는 초기 구축 단계에서 기본 허용 정책을 유지하며, 추후 보안 강화 단계에서 필요한 목적지와 포트로 제한할 예정이다.
+
+DB 간 MySQL 복제 통신(TCP 3306)은 Replica 구축 단계에서 추가한다.
+
+## 3. Security Group과 NACL 비교
+
+| 구분 | Security Group | NACL |
+|---|---|---|
+| 적용 위치 | 네트워크 인터페이스 | Subnet |
+| 동작 방식 | Stateful | Stateless |
+| 허용/거부 | 허용 규칙 | 허용 및 거부 규칙 |
+| 응답 트래픽 | 연결 상태에 따라 자동 허용 | 별도 규칙 필요 |
+| 규칙 처리 | 전체 허용 규칙 평가 | 규칙 번호순 평가 |
+
+이번 프로젝트에서는 Security Group을 중심으로 접근을 제어한다.
+
+NACL은 기본 구성을 유지하여 초기 구축 시 불필요한 네트워크 차단 문제를 방지한다.
+
+## 4. Bastion Host 설계
+
+### 4.1 구축 이유
+
+Private Subnet의 WEB/WAS/DB 서버에 퍼블릭 IP를 부여하지 않고 관리자가 SSH를 통해 접속할 수 있는 구조를 준비하였다.
+
+```text
+Windows PC
+    |
+    | SSH TCP 22
+    v
+Bastion Host
+(Public Subnet)
+    |
+    | SSH TCP 22
+    v
+Private EC2
+(WEB / WAS / DB)
+```
+
+### 4.2 Bastion EC2 구성
+
+| 항목 | 설정 |
+|---|---|
+| Instance Name | marble-bastion |
+| OS | Ubuntu Server 24.04 LTS |
+| Instance Type | t3.micro |
+| VPC | marble-vpc |
+| Subnet | marble-public-a |
+| Private IPv4 | 10.0.1.172 |
+| Public IPv4 | 할당 |
+| Security Group | marble-sg-bastion |
+| Storage | 8 GiB gp3 |
+| SSH User | ubuntu |
+| Key Pair | marble-key |
+
+### 4.3 SSH 접근 통제
+
+Bastion의 SSH 인바운드는 관리자 공인 IP/32만 허용하도록 구성하였다.
+
+Private 서버의 SSH 인바운드는 marble-sg-bastion 보안 그룹에서 시작하는 연결만 허용하도록 준비하였다.
+
+## 5. Bastion 접속 검증
+
+Windows PowerShell에서 SSH 접속을 진행하였다.
+
+```powershell
+ssh -i .\marble-key.pem ubuntu@<BASTION_PUBLIC_IP>
+```
+
+접속 후 사용자 계정을 확인하였다.
+
+```bash
+whoami
+```
+
+실제 확인 결과:
+
+```text
+ubuntu@ip-10-0-1-172:~$ whoami
+ubuntu
+```
+
+### 검증 결과
+
+**성공: Windows PC → Bastion EC2 SSH 접속**
+
+이를 통해 다음 구간이 정상적으로 동작함을 확인하였다.
+
+- Public Subnet의 인터넷 접근 경로
+- Bastion 퍼블릭 IP를 통한 SSH 접근
+- Bastion Security Group의 인바운드 정책
+- SSH 키 인증 및 Ubuntu 사용자 로그인
+
+단, Bastion → Private EC2 접속은 Private 서버 구축 후 별도로 검증할 예정이다.
+
+## 6. 기술 선택 이유
+
+### Bastion Host
+
+외부에서 Private EC2로 직접 SSH 접속하지 않도록 관리자 접속 경로를 분리하기 위해 선택하였다.
+
+### Security Group 참조
+
+ALB, WEB, WAS, DB의 IP 변경에 따라 보안 정책을 매번 수정하지 않도록 서버 역할별 Security Group을 참조하는 방식으로 구성하였다.
+
+### Private Subnet
+
+WEB/WAS/DB 서버에 직접적인 인터넷 인바운드 경로를 제공하지 않도록 설계하였다.
+
+### SSH ProxyJump 계획
+
+SSH 개인키를 Bastion 서버에 저장하지 않고 관리자 PC에서 Bastion을 경유하여 Private EC2에 접속할 예정이다.
+
+## 7. 향후 개선 사항
+
+- HTTPS 443 및 TLS 인증서 구성
+- Security Group 아웃바운드 최소 권한 정책
+- MySQL Primary/Replica 복제 전용 접근 규칙
+- SSH 접속 로그 및 관리자 접근 기록 관리
+- AWS Systems Manager Session Manager 대안 검토
+- Bastion 단일 AZ 장애 대응 방안 검토
+
+## 8. 다음 단계
+
+7교시에서 다음 작업을 진행한다.
+
+1. AZ-A의 WEB01, WAS01, DB01 EC2 생성
+2. Bastion을 통한 Private EC2 SSH 접속 검증
+3. 필요 시 NAT Gateway를 구성하여 패키지 설치
+4. Apache, Java 21, MySQL 설치
+5. VMware 환경에서 Marble 애플리케이션 및 MySQL 데이터 이전
+6. WEB → WAS → DB 통신 및 서비스 동작 검증
+7. 이후 AMI를 활용하여 AZ-C에 WEB02/WAS02 배포
+
+
+
+
+
