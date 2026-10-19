@@ -1,1 +1,133 @@
+# 05. AWS VPC 및 네트워크 구축
+
+## 1. 구축 목적
+
+VMware On-Premises 환경에서 운영 중인 Marble 3-Tier 서비스를 AWS로 마이그레이션하기 위해 VPC와 서브넷을 구성한다.
+
+2개 가용 영역(AZ)을 활용하여 향후 WEB/WAS 이중화 및 MySQL Primary/Replica 구성을 지원하도록 설계하였다.
+
+## 2. VPC 구성
+
+| 항목 | 설정 |
+|---|---|
+| Region | ap-northeast-2 (Seoul) |
+| VPC | marble-vpc |
+| CIDR | 10.0.0.0/16 |
+| AZ | ap-northeast-2a, ap-northeast-2c |
+| Internet Gateway | marble-igw |
+
+### VPC 설계 이유
+
+- 독립적인 사설 네트워크 구성
+- 서버 역할에 따른 서브넷 분리
+- Public/Private 네트워크의 라우팅 경로 분리
+- 2개 AZ를 이용한 가용성 확보 기반 마련
+
+## 3. Subnet 구성
+
+| 이름 | AZ | CIDR | 용도 |
+|---|---|---|---|
+| marble-public-a | 2a | 10.0.1.0/24 | ALB, Bastion |
+| marble-public-c | 2c | 10.0.2.0/24 | ALB |
+| marble-web-a | 2a | 10.0.11.0/24 | Apache WEB01 |
+| marble-web-c | 2c | 10.0.12.0/24 | Apache WEB02 |
+| marble-was-a | 2a | 10.0.21.0/24 | Spring Boot WAS01 |
+| marble-was-c | 2c | 10.0.22.0/24 | Spring Boot WAS02 |
+| marble-db-a | 2a | 10.0.31.0/24 | MySQL Primary |
+| marble-db-c | 2c | 10.0.32.0/24 | MySQL Replica |
+
+서브넷은 Public 2개, Private 6개로 구성하였다.
+
+각 서브넷은 서로 겹치지 않는 CIDR을 사용한다.
+
+## 4. Internet Gateway 구성
+
+리소스 이름: `marble-igw`
+
+Internet Gateway를 VPC에 연결하여 인터넷 통신을 위한 경로를 준비하였다.
+
+IGW를 생성하고 연결하는 것만으로 인터넷 연결이 완성되지는 않는다.
+
+서브넷의 라우팅 테이블과 퍼블릭 IP, 보안 설정 등이 함께 충족되어야 한다.
+
+## 5. Route Table 구성
+
+### 5.1 Public Route Table
+
+이름: `marble-rtb-public`
+
+| Destination | Target |
+|---|---|
+| 10.0.0.0/16 | local |
+| 0.0.0.0/0 | marble-igw |
+
+연결 서브넷:
+- marble-public-a
+- marble-public-c
+
+### 5.2 Private Route Table — AZ-A
+
+이름: `marble-rtb-private-a`
+
+| Destination | Target |
+|---|---|
+| 10.0.0.0/16 | local |
+
+연결 서브넷:
+- marble-web-a
+- marble-was-a
+- marble-db-a
+
+### 5.3 Private Route Table — AZ-C
+
+이름: `marble-rtb-private-c`
+
+| Destination | Target |
+|---|---|
+| 10.0.0.0/16 | local |
+
+연결 서브넷:
+- marble-web-c
+- marble-was-c
+- marble-db-c
+
+Private Subnet에는 현재 IGW 또는 NAT Gateway를 통한 기본 경로를 설정하지 않았다.
+
+## 6. NAT Gateway 구성 계획
+
+NAT Gateway는 EC2 구축 및 소프트웨어 설치 시점에 생성할 예정이다.
+
+계획:
+1. AZ-A Public Subnet에 NAT Gateway 생성
+2. 필요한 Private Subnet에 임시 아웃바운드 경로 설정
+3. Apache, Java, MySQL 패키지 설치
+4. 애플리케이션과 서비스 환경 구성
+5. AMI 생성 및 다른 AZ에 배포
+6. NAT Gateway 삭제 또는 유지 필요성 재평가
+
+단일 AZ NAT Gateway는 다른 AZ의 아웃바운드 통신을 지원할 수 있으나, AZ 간 데이터 전송 비용과 가용성 제약이 존재한다.
+
+## 7. 구축 결과
+
+- VPC 1개 생성
+- Public Subnet 2개 생성
+- Private Subnet 6개 생성
+- Internet Gateway 생성 및 VPC 연결
+- Public Route Table 1개 구성
+- Private Route Table 2개 구성
+- 서브넷별 라우팅 테이블 연결
+
+현재 단계에서는 네트워크 리소스 구성을 완료하였다.
+
+EC2 간 통신, 인터넷 접근, Security Group 및 애플리케이션 연결은 후속 교시에서 검증한다.
+
+## 8. 다음 단계
+
+- Security Group 설계
+- Bastion Host 구축
+- Private EC2 생성
+- 필요 시 NAT Gateway 구성
+- VMware → AWS Marble 애플리케이션 및 MySQL 데이터 이전
+- AMI 기반 WEB/WAS 이중화
+- ALB 및 MySQL 복제 구성
 
