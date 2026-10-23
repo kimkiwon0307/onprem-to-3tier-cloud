@@ -300,6 +300,7 @@ sudo tail -n 50 /var/log/apache2/error.log
 
 세 가지를 각각 확인해야 한다.
 
+<img width="1312" height="1199" alt="image" src="https://github.com/user-attachments/assets/36895100-61e6-4c7f-a662-e030829778b7" />
 
 
 
