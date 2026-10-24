@@ -339,3 +339,7 @@ WEB 내부에서 HTTP 200을 받았더라도 ALB → WEB 통신까지 검증된 
 **ALB → WEB = 로드밸런싱**
 
 **WEB → WAS = Reverse Proxy**
+
+<img width="1312" height="1199" alt="image" src="https://github.com/user-attachments/assets/a87742d8-6f81-44c3-9b03-5eb3f42059bd" />
+
+
